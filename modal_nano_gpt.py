@@ -102,43 +102,6 @@ class Dataset(object):
         model.train()
         return out
 
-#######################
-### Attention Model ###
-#######################
-class Head(nn.Module):
-    """One head self-attention."""
-
-    def __init__(self, hparams, input_size, head_size):
-        super().__init__()
-        self.head_size = head_size
-        self.query = nn.Linear(input_size, head_size, bias=False)
-        self.key = nn.Linear(input_size, head_size, bias=False)
-        self.value = nn.Linear(input_size, head_size, bias=False)
-        self.dropout = nn.Dropout(hparams.dropout)
-
-        self.register_buffer('tril',
-            torch.tril(
-                torch.ones(hparams.context_size, hparams.context_size)))
-
-    def forward(self, x):
-        B, T, C = x.shape
-
-        q = self.query(x)  # bth
-        k = self.key(x)  # bth
-        v = self.value(x)  # bth
-
-        weight = torch.einsum("bth,buh->btu", q, k)
-        # Causal Mask
-        weight = weight.masked_fill(self.tril[:T,:T] == 0, float('-inf'))
-        # Normalize to reduce output varirance to 1
-        weight /= np.sqrt(self.head_size)
-        dist = F.softmax(weight, dim=-1)  # btt
-        dist = self.dropout(dist)
-
-        out = torch.einsum("btu,buh->bth", dist, v)  # bth
-
-        return out
-
 class MultiHeadFast(nn.Module):
     """Multihead self-attention."""
 
@@ -191,23 +154,8 @@ class MultiHeadFast(nn.Module):
         multi_head_out = heads_out.transpose(1, 2).reshape(B, T, C) # bth
         return self.out_dropout(self.proj(multi_head_out))
 
-class MultiHead(nn.Module):
-    """Multihead self-attention."""
-
-    def __init__(self, hparams, input_size):
-        super().__init__()
-        head_size = input_size // hparams.n_heads
-        self.heads = nn.ModuleList([Head(hparams, input_size, head_size)
-            for _ in range(hparams.n_heads)])
-        self.proj = nn.Linear(input_size, input_size)
-        self.dropout = nn.Dropout(hparams.dropout)
-
-    def forward(self, x):
-        sa_out = torch.cat([head(x) for head in self.heads], dim=-1)
-        return self.dropout(self.proj(sa_out))
-
 class MLP(nn.Module):
-    """ One layer MLP."""
+    """ Multi-Layer Perception (last ops of each block)."""
 
     def __init__(self, hparams, input_size):
         super().__init__()
@@ -223,7 +171,6 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, hparams):
         super().__init__()
-        # self.sa_heads = MultiHead(hparams, hparams.n_embed)
         self.sa_heads = MultiHeadFast(hparams, hparams.n_embed)
         self.mlp = MLP(hparams, hparams.n_embed)
         self.ln1 = nn.LayerNorm(hparams.n_embed)
@@ -275,8 +222,6 @@ class AttentionModel(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
         for i in range(max_new_tokens):
-            # Make predictions
-            # pdb.set_trace()
             logits = self(idx[:, -self.context_size:])[0] # B,T,C
             logits = logits[:,-1,:] # B,C
             probs = F.softmax(logits, dim=-1)
@@ -285,45 +230,16 @@ class AttentionModel(nn.Module):
         return idx
 
 
-@app.cls(image=torch_image, gpu=gpu)
-class BigramModel(nn.Module):
-    def __init__(self, vocab_size):
-        super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
-
-    def forward(self, idx, targets=None):
-        # idx - (B, T)
-        logits = self.token_embedding_table(idx)
-
-        if targets is not None:
-            xlogits = logits.view(logits.shape[0] * logits.shape[1], -1)
-            xtargets = targets.view(-1)
-            loss = F.cross_entropy(xlogits, xtargets)
-        else:
-            loss = None
-
-        return logits, loss
-
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            # Make predictions
-            logits = self(idx)[0] # B,T,C
-            logits = logits[:,-1,:] # B,C
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, idx_next], axis=1)
-        return idx
-
 @dataclass
 class ModelHyperparameters:
-    # Fast
+    # Tiny
     # n_heads: int = 4
     # n_embed: int = 32
     # n_blocks: int = 3
     # context_size: int = 16
     # dropout: float = 0.2
 
-    # Mid
+    # Small
     # n_heads: int = 4
     # n_embed: int = 128
     # n_blocks: int = 4
@@ -331,6 +247,7 @@ class ModelHyperparameters:
     # dropout: float = 0.2
 
     # Karpathy
+    # https://www.youtube.com/watch?v=kCc8FmEb1nY&t=5976s
     n_heads: int = 6
     n_embed: int = 384
     n_blocks: int = 6
@@ -338,7 +255,7 @@ class ModelHyperparameters:
     dropout: float = 0.2
 
 @app.function(image=torch_image, gpu=gpu)
-def func():
+def modal_start():
     #######################
     ### Hyperparameters ###
     #######################
@@ -368,7 +285,6 @@ def func():
                       batch_size, hparams.context_size, n_eval_steps, device)
 
     # Build Model
-    # model = BigramModel(dataset.vocab_size)
     model = AttentionModel(dataset.vocab_size, hparams, device)
     m = model.to(device)
     num_parameters = sum(p.numel() for p in model.parameters())
@@ -424,6 +340,6 @@ def func():
 
 @app.local_entrypoint()
 def main():
-    ret = func.remote()
+    ret = modal_start.remote()
     print ('returned: ', ret)
     print ('not run on modal')
