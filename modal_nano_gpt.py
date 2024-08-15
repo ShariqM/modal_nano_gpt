@@ -13,9 +13,9 @@ size = 'tiny'   # CPU
 # size = 'small'  # CPU/GPU
 # size = 'medium' # GPU
 
-gpu = None
+# gpu = None
 # gpu = "T4"
-# gpu = "A10G"
+gpu = "A10G"
 
 timeout = 20 * 60  # 20 minutes
 # timeout =  5 * 60  # Default 5 minutes
@@ -45,7 +45,8 @@ class ModelHyperparameters:
 
 volume = modal.Volume.from_name("nano_gpt_volume")
 volume_path = Path("/vol/data")
-model_filename = "nano_gpt_model_v0.2.pt"
+model_filename = "nano_gpt_model.pt"
+# model_filename = "nano_gpt_model_v0.2.pt"
 medium_model_path = volume_path / "medium" / model_filename
 log_path = volume_path / "logs"
 
@@ -273,8 +274,8 @@ class AttentionModel(nn.Module):
         return idx
 
 @app.function(
-	image=image, # Without this, dataset crashes with "torch not found"
-	volumes={volume_path: volume})
+    image=image, # Without this, dataset crashes with "torch not found"
+    volumes={volume_path: volume})
 @modal.wsgi_app()
 def monitor():
     import tensorboard
@@ -424,7 +425,10 @@ def modal_start():
 class ModelInference:
     @modal.enter()
     def load_model(self):
-        checkpoint = torch.load(volume_path / model_filename)
+        # Latest model:
+        # checkpoint = torch.load(volume_path / model_filename)
+        # Fixed to medium model out:
+        checkpoint = torch.load(medium_model_path)
         hparams = checkpoint['hparams']
 
         chars = checkpoint['chars']
@@ -456,6 +460,13 @@ class ModelInference:
 #######################
 ### Web Application ###
 #######################
+@app.function(image=image) # Why do I need this image? Torch again.
+@modal.web_endpoint(method="POST")
+def web_generate(item: dict):
+    output = ModelInference().generate.remote(item['prompt'])
+    return {'web_generate': output}
+    # return {'web_generate': f"Hello {x}!"}
+
 @app.function(
     image=image,
     concurrency_limit=3,
