@@ -1,56 +1,95 @@
 import modal
 from modal import Image, build, enter, method
 from dataclasses import dataclass
+from pathlib import Path
 
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
 
-##################
-### Image Code ###
-##################
-# gpu = None
-gpu = "A10G"
+##############
+### Setup ####
+##############
+size = 'tiny'   # CPU
+# size = 'small'  # CPU/GPU
+# size = 'medium' # GPU
+
+gpu = None
 # gpu = "T4"
-def image_setup():
-    import requests
-    import os
+# gpu = "A10G"
 
-    # Download dataset if not there yet.
-    input_file_path = os.path.join(os.path.dirname(__file__), 'shakespeare_char.txt')
-    if not os.path.exists(input_file_path):
-        print ("Downloading Shakespeare dataset...")
-        data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-        with open(input_file_path, 'w') as f:
-            f.write(requests.get(data_url).text)
+timeout = 20 * 60  # 20 minutes
+# timeout =  5 * 60  # Default 5 minutes
+
+@dataclass
+class ModelHyperparameters:
+    if size == 'tiny':
+        n_heads: int = 4
+        n_embed: int = 32
+        n_blocks: int = 3
+        context_size: int = 16
+        dropout: float = 0.2
+    elif size == 'small':
+        n_heads: int = 4
+        n_embed: int = 128
+        n_blocks: int = 4
+        context_size: int = 64
+        dropout: float = 0.2
     else:
-        print ("Shakespeare dataset already here.")
+        # https://www.youtube.com/watch?v=kCc8FmEb1nY&t=5976s
+        n_heads: int = 6
+        n_embed: int = 384
+        n_blocks: int = 6
+        context_size: int = 256
+        dropout: float = 0.2
 
+
+volume = modal.Volume.from_name("nano_gpt_volume")
+volume_path = Path("/vol/data")
+model_filename = "nano_gpt_model_v0.2.pt"
+medium_model_path = volume_path / "medium" / model_filename
+log_path = volume_path / "logs"
+
+web_app = FastAPI()
+assets_path = Path(__file__).parent / "assets"
 
 app = modal.App("modal_nano_gpt")
-torch_image = (
+image = (
     Image.debian_slim(python_version="3.11")
     .pip_install(
         "torch==2.1.2",
-        "requests==2.26.0",
+        "gradio~=3.50.2",
+        "tensorboard",
+        "tensorflow==2.12.0"
     )
-    .run_function(image_setup)
 )
 
-with torch_image.imports():
+with image.imports():
     import numpy as np
+    import os
+    from datetime import datetime
+    from timeit import default_timer as timer
+
     import torch
     import torch.nn as nn
     from torch.nn import functional as F
-    from timeit import default_timer as timer
 
-###################
-### Remote Code ###
-###################
-@app.cls(image=torch_image, gpu=gpu)
+    import tensorboard
+    import tensorflow as tf
+
+###############
+### Dataset ###
+###############
+@app.cls(
+    image=image,
+    volumes={volume_path: volume},
+    gpu=gpu,
+    timeout=timeout)
 class Dataset(object):
     """Manage text dataset and encoding & decoding."""
 
     def __init__(self, txt_filename, train_percent, batch_size,
                  context_size, n_eval_steps, device):
-        with open(txt_filename, 'r', encoding='utf-8') as f:
+        with open(volume_path / txt_filename, 'r', encoding='utf-8') as f:
             text = f.read()
         self.device = device
         self.batch_size = batch_size
@@ -59,14 +98,13 @@ class Dataset(object):
         assert (train_percent > 0.0) and (train_percent < 1.0), (
             "train_percent must be in (0,1)")
 
-
-        chars = sorted(list(set(text)))
-        self.vocab_size = len(chars)
+        self.chars = sorted(list(set(text)))
+        self.vocab_size = len(self.chars)
         print (f"Vocab Size: {self.vocab_size}")
-        print ('Unique letters: ', ''.join(chars))
+        print ('Unique letters: ', ''.join(self.chars))
 
-        stoi = {c:i for i,c in enumerate(chars)}
-        itos = {i:c for i,c in enumerate(chars)}
+        stoi = {c:i for i,c in enumerate(self.chars)}
+        itos = {i:c for i,c in enumerate(self.chars)}
         self.encode = lambda s: [stoi[c] for c in s]
         self.decode = lambda l: [itos[i] for i in l]
         self.newline_encoded = self.encode(['\n'])[0]
@@ -102,6 +140,9 @@ class Dataset(object):
         model.train()
         return out
 
+#######################
+### Attention Model ###
+#######################
 class MultiHeadFast(nn.Module):
     """Multihead self-attention."""
 
@@ -181,8 +222,11 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x
 
-
-@app.cls(image=torch_image, gpu=gpu)
+@app.cls(
+    image=image,
+    volumes={volume_path: volume},
+    gpu=gpu,
+    timeout=timeout)
 class AttentionModel(nn.Module):
     def __init__(self, vocab_size, hparams, device):
         super().__init__()
@@ -229,32 +273,35 @@ class AttentionModel(nn.Module):
             idx = torch.cat([idx, idx_next], axis=1)
         return idx
 
+@app.function(
+	image=image, # Without this, dataset crashes with "torch not found"
+	volumes={volume_path: volume})
+@modal.wsgi_app()
+def monitor():
+    import tensorboard
 
-@dataclass
-class ModelHyperparameters:
-    # Tiny
-    # n_heads: int = 4
-    # n_embed: int = 32
-    # n_blocks: int = 3
-    # context_size: int = 16
-    # dropout: float = 0.2
+    board = tensorboard.program.TensorBoard()
+    board.configure(logdir=str(log_path))
+    (data_provider, deprecated_multiplexer) = board._make_data_provider()
+    wsgi_app = tensorboard.backend.application.TensorBoardWSGIApp(
+        board.flags,
+        board.plugin_loaders,
+        data_provider,
+        board.assets_zip_provider,
+        deprecated_multiplexer,
+    )
+    return wsgi_app
 
-    # Small
-    # n_heads: int = 4
-    # n_embed: int = 128
-    # n_blocks: int = 4
-    # context_size: int = 64
-    # dropout: float = 0.2
+def print_banner(string):
+    print ('#' * (len(string) + 8))
+    print (f'### {string} ###')
+    print ('#' * (len(string) + 8))
 
-    # Karpathy
-    # https://www.youtube.com/watch?v=kCc8FmEb1nY&t=5976s
-    n_heads: int = 6
-    n_embed: int = 384
-    n_blocks: int = 6
-    context_size: int = 256
-    dropout: float = 0.2
-
-@app.function(image=torch_image, gpu=gpu)
+@app.function(
+    image=image,
+    volumes={volume_path: volume},
+    gpu=gpu,
+    timeout=timeout)
 def modal_start():
     #######################
     ### Hyperparameters ###
@@ -275,7 +322,7 @@ def modal_start():
             "n_embed must be divisible by n_heads")
     # Misc
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print (f'Remote Device: {device} // {gpu}')
+    print_banner(f'Remote Device: {device} // {gpu}')
 
     #########################
     ### Data & Model prep ###
@@ -288,7 +335,7 @@ def modal_start():
     model = AttentionModel(dataset.vocab_size, hparams, device)
     m = model.to(device)
     num_parameters = sum(p.numel() for p in model.parameters())
-    print (f"Num parameters: {num_parameters}")
+    print_banner(f"Num parameters: {num_parameters}")
 
     # Helper function for kicking off model generation
     def generate(model, n_new_tokens):
@@ -300,12 +347,19 @@ def modal_start():
         str_out = "".join(chars_out)
         return str_out
 
+    # Make sure generate works before training.
     n_new_tokens = 100
-    print ("Before Training Generation: ", generate(model, n_new_tokens))
+    generate(model, n_new_tokens) # ignore return val
 
     ################
     ### Training ###
     ################
+    log_dir = log_path / f"E{datetime.now().strftime('%Y-%m%d-%H%M%S.%f')}"
+    os.makedirs(log_dir)
+    train_writer = tf.summary.create_file_writer(f"{log_dir}/train")
+    # TODO: Add validation writer
+    # val_writer = tf.summary.create_file_writer(f"{log_dir}/val")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     t_last = timer()
     for step in range(n_steps):
@@ -318,6 +372,10 @@ def modal_start():
         loss.backward()
         optimizer.step()
 
+        # logging
+        with train_writer.as_default():
+            tf.summary.scalar(f"Cross Entropy Loss", loss.item(), step=step)
+
         if step % n_steps_before_eval == 0:
             out = dataset.eval_model(model)
             runtime_s = timer() - t_last
@@ -326,6 +384,7 @@ def modal_start():
                 f" {out['val']:.2f}")
             t_last = timer()
 
+
     out = dataset.eval_model(model)
     runtime_s = timer() - t_last
     print (f"Final) // {runtime_s:>5.2f}"
@@ -333,10 +392,161 @@ def modal_start():
         f" {out['val']:.2f}")
     print (f"Num parameters: {num_parameters}")
 
+    ##################
+    ### Save Model ###
+    ##################
+    print (f"Saving model to {volume_path}")
+    checkpoint = {
+        'model': model.state_dict(),
+        'chars': dataset.chars,
+        'optimizer': optimizer.state_dict(),
+        'val_loss': out['val'],
+        'hparams': hparams,
+    }
+    torch.save(checkpoint, volume_path / model_filename)
+
+
+    ##################
+    ### Generation ###
+    ##################
     n_new_tokens = 1000
     print ("After Training Generation: ", generate(model, n_new_tokens))
     return -1
 
+######################################
+### Model Inferece for Web Serving ###
+######################################
+@app.cls(
+    image=image,
+    volumes={volume_path: volume},
+    gpu=gpu)
+class ModelInference:
+    @modal.enter()
+    def load_model(self):
+        checkpoint = torch.load(volume_path / model_filename)
+        hparams = checkpoint['hparams']
+
+        chars = checkpoint['chars']
+        vocab_size = len(chars)
+        stoi = {c:i for i,c in enumerate(chars)}
+        itos = {i:c for i,c in enumerate(chars)}
+        self.encode = lambda s: [stoi[c] for c in s]
+        self.decode = lambda l: [itos[i] for i in l]
+
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        self.model = AttentionModel(vocab_size, hparams, self.device)
+        self.model.load_state_dict(checkpoint['model'])
+        self.model.to(self.device)
+
+    @modal.method()
+    def generate(self, prompt):
+        n_new_tokens = 1000
+        encoded_prompt = self.encode(prompt)
+        torch_input = torch.tensor(encoded_prompt, dtype=torch.long)
+        torch_input = torch_input.view(1, len(torch_input)) # Batch dim.
+        torch_input = torch_input.to(self.device)
+
+        gen_out = self.model.generate(torch_input, n_new_tokens)[0] # 0th batch
+        chars_out = self.decode([x for x in gen_out.tolist()])
+        str_out = "".join(chars_out)
+        return str_out
+
+#######################
+### Web Application ###
+#######################
+@app.function(
+    image=image,
+    concurrency_limit=3,
+    mounts=[modal.Mount.from_local_dir(assets_path, remote_path="/assets")],
+)
+@modal.asgi_app()
+def fastapi_app():
+    import gradio as gr
+    from gradio.routes import mount_gradio_app
+
+    # Call out to the inference in a separate Modal environment with a GPU
+    def go(text=""):
+        if not text:
+            text = example_prompts[0]
+        # return text[::-1]
+        return ModelInference().generate.remote(text)
+
+    example_prompts = [
+        f"Where art thou Lucas?",
+        f"Were that it was",
+        f"Macbeth, fair is foul, foul is fair, but who are you?",
+        f"Brevity is the soul of wit, so what is the soul of foolishness?",
+    ]
+
+
+    # custom styles: an icon, a background, and a theme
+    @web_app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        return FileResponse("/assets/favicon.svg")
+
+    @web_app.get("/assets/background.svg", include_in_schema=False)
+    async def background():
+        return FileResponse("/assets/background.svg")
+
+    with open("/assets/index.css") as f:
+        css = f.read()
+
+    theme = gr.themes.Default(
+        primary_hue="green", secondary_hue="emerald", neutral_hue="neutral"
+    )
+
+    # add a gradio UI around inference
+    with gr.Blocks(
+        theme=theme, css=css, title="Tiny LLM"
+    ) as interface:
+        # Title
+        gr.Markdown(
+            f"# Generate Shakespeare text using the prompt",
+        )
+
+        # Input and Output
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("## Input:")
+                inp = gr.Textbox(  # input text component
+                    label="",
+                    placeholder=f"Write some Shakespeare like text or keep it empty!",
+                    lines=10,
+                )
+            with gr.Column():
+                gr.Markdown("## Output:")
+                out = gr.Textbox(  # output text component
+                    label="",
+                    lines=10,
+                )
+
+        # Button to trigger inference and a link to Modal
+        with gr.Row():
+            btn = gr.Button("Generate", variant="primary", scale=2)
+            btn.click(
+                fn=go, inputs=inp, outputs=out
+            )  # connect inputs and outputs with inference function
+
+            gr.Button(  # shameless plug
+                " Powered by Modal",
+                variant="secondary",
+                link="https://modal.com",
+            )
+
+        # Example prompts
+        with gr.Column(variant="compact"):
+            # add in a few examples to inspire users
+            for ii, prompt in enumerate(example_prompts):
+                btn = gr.Button(prompt, variant="secondary")
+                btn.click(fn=lambda idx=ii: example_prompts[idx], outputs=inp)
+
+    # mount for execution on Modal
+    return mount_gradio_app(
+        app=web_app,
+        blocks=interface,
+        path="/",
+    )
 
 @app.local_entrypoint()
 def main():

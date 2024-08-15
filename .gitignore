@@ -1,3 +1,4 @@
 archive/
 *.pyc
 *.swp
+.DS_STORE
