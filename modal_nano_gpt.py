@@ -59,7 +59,6 @@ image = (
         "torch==2.1.2",
         "gradio~=3.50.2",
         "tensorboard",
-        "tensorflow==2.12.0"
     )
 )
 
@@ -74,7 +73,7 @@ with image.imports():
     from torch.nn import functional as F
 
     import tensorboard
-    import tensorflow as tf
+    from torch.utils.tensorboard import SummaryWriter
 
 ###############
 ### Dataset ###
@@ -354,9 +353,11 @@ def modal_start():
     ################
     ### Training ###
     ################
-    log_dir = log_path / f"E{datetime.now().strftime('%Y-%m%d-%H%M%S.%f')}"
+    experiment_name = f"E{datetime.now().strftime('%Y-%m%d-%H%M%S.%f')}"
+    print_banner(experiment_name)
+    log_dir = log_path / experiment_name
     os.makedirs(log_dir)
-    train_writer = tf.summary.create_file_writer(f"{log_dir}/train")
+    train_writer = SummaryWriter(log_dir=f"{log_dir}/train")
     # TODO: Add validation writer
     # val_writer = tf.summary.create_file_writer(f"{log_dir}/val")
 
@@ -373,8 +374,7 @@ def modal_start():
         optimizer.step()
 
         # logging
-        with train_writer.as_default():
-            tf.summary.scalar(f"Cross Entropy Loss", loss.item(), step=step)
+        train_writer.add_scalar(f"Cross Entropy Loss", loss.item(), step)
 
         if step % n_steps_before_eval == 0:
             out = dataset.eval_model(model)
@@ -383,6 +383,7 @@ def modal_start():
                 f" // Train Loss: {out['train']:.2f} // Val Loss:"
                 f" {out['val']:.2f}")
             t_last = timer()
+            train_writer.flush()
 
 
     out = dataset.eval_model(model)
