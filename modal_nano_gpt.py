@@ -1,3 +1,24 @@
+# Hyperparameter optimization of LLM Training with Modal
+#
+# Trains an GPT LLM model from scratch on Shakespeare text data.
+#
+# A single experiment trains multiple models with different hyperparameters.
+# The experiment name is 'E' followed by a datetimestamp.
+#
+# Logging:
+# volume/logs/E2024-01-01-000000.000000/
+#   E2024-01-01-000000.000000_context=8_n_heads=1_dropout=0.0/train
+#
+# Model Checkpoints:
+# volume/models/E2024-01-01-000000.000000/
+#  E2024-01-01-000000.000000_context=8_n_heads=1_dropout=0.0/nano_gpt_model.pt
+#
+# There will best a symlink that links to the best hyperparameter model:
+# volume/models/E2024-01-01-000000.000000/best_nano_gpt_model.pt
+#
+# When serving the model this symlink will be used.
+#
+
 import modal
 from modal import Image, build, enter, method
 from dataclasses import dataclass
@@ -59,8 +80,7 @@ class ModelHyperparameters:
 volume = modal.Volume.from_name("nano_gpt_volume")
 volume_path = Path("/vol/data")
 model_filename = "nano_gpt_model.pt"
-# model_filename = "nano_gpt_model_v0.2.pt"
-medium_model_path = volume_path / "medium" / model_filename
+best_model_filename = "best_nano_gpt_model.pt"
 log_path = volume_path / "logs"
 save_path = volume_path / "models"
 
@@ -98,6 +118,13 @@ def print_banner(string):
 ###############
 ### Dataset ###
 ###############
+def build_encode_decode(chars):
+    stoi = {c:i for i,c in enumerate(chars)}
+    itos = {i:c for i,c in enumerate(chars)}
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: [itos[i] for i in l]
+    return encode, decode
+
 @app.cls(
     image=image,
     volumes={volume_path: volume},
@@ -122,10 +149,7 @@ class Dataset(object):
         print (f"Vocab Size: {self.vocab_size}")
         print ('Unique letters: ', ''.join(self.chars))
 
-        stoi = {c:i for i,c in enumerate(self.chars)}
-        itos = {i:c for i,c in enumerate(self.chars)}
-        self.encode = lambda s: [stoi[c] for c in s]
-        self.decode = lambda l: [itos[i] for i in l]
+        self.encode, self.decode = build_encode_decode(self.chars)
         self.newline_encoded = self.encode(['\n'])[0]
 
         # Train/Validation.
@@ -292,34 +316,10 @@ class AttentionModel(nn.Module):
             idx = torch.cat([idx, idx_next], axis=1)
         return idx
 
-@app.function(
-    image=image, # Without this, dataset crashes with "torch not found"
-    volumes={volume_path: volume})
-@modal.wsgi_app()
-def monitor_training():
-    # if FLAGS.monitor_experiment_name is not None:
-        # monitor_path = log_path / FLAGS.monitor_experiment_name
-    # else:
-        # log_paths = glob.glob(f"{log_path}/*")
-        # latest_log_path = max(log_paths, key=os.path.getctime)
-        # monitor_path = Path(latest_log_path)
-    log_paths = glob.glob(f"{log_path}/*")
-    latest_log_path = max(log_paths, key=os.path.getctime)
-    monitor_path = Path(latest_log_path)
-    print_banner(f"Monitoring: {monitor_path.name}")
-
-    board = tensorboard.program.TensorBoard()
-    board.configure(logdir=str(monitor_path))
-    (data_provider, deprecated_multiplexer) = board._make_data_provider()
-    wsgi_app = tensorboard.backend.application.TensorBoardWSGIApp(
-        board.flags,
-        board.plugin_loaders,
-        data_provider,
-        board.assets_zip_provider,
-        deprecated_multiplexer,
-    )
-    return wsgi_app
-
+def build_model_name(experiment_name, hparams):
+    return (f"{experiment_name}"
+        f"_context={hparams.context_size}_n_heads={hparams.n_heads}"
+        f"_dropout={hparams.dropout}")
 
 @app.function(
     image=image,
@@ -335,7 +335,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     n_steps = 5000
     n_eval_steps = 100
     n_steps_before_eval = int(n_steps/10.) # eval every 10% of training
-    n_steps_before_checkpoint = int(n_steps/5.) # checkpoint every 20% of
+    n_steps_before_checkpoint = int(n_steps/5.) # save every 20% of training
     train_percent = 0.9
     # learning_rate = 1e-2
     # learning_rate = 1e-3
@@ -379,11 +379,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     ####################################
     ### Logging & Checkpointing prep ###
     ####################################
-    # experiment_name is used twice intentionally below:
-    # Put experiment in model name so we can see it on Tensorboard
-    model_name = (f"{experiment_name}"
-        f"_context={hparams.context_size}_n_heads={hparams.n_heads}"
-        f"_dropout={hparams.dropout}")
+    model_name = build_model_name(experiment_name, hparams)
     print_banner(model_name)
     # Create a experiment name folder so Tensorboard can group by experiment
     model_log_dir = log_path / f"{experiment_name}/{model_name}"
@@ -398,13 +394,26 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     train_writer.add_text("Hyperparameters", pretty_hparams_str)
 
     # Load & Checkpointing code
-    model_save_dir = save_path / model_name
+    model_save_dir = save_path / experiment_name / model_name
+    volume.reload()  # Make sure we have the latest data.
     if model_save_dir.exists():
         print ("Loading model from checkpiont...")
         checkpoint = torch.load(str(model_save_dir / model_filename))
+        if run_to_first_save:
+            # Already done. Someone restarted the job.
+            print ("Stopping early...")
+            return checkount['val_loss'], hparams
+        else:
+            # Hacky: I must be the best model for this experiment.
+            # Create symlink to the best model for serving purposes.
+            os.symlink(str(model_save_dir / model_filename),
+                        str(save_path / experiment_name / best_model_filename))
+            volume.commit()
+
         model.load_state_dict(checkpoint['model'])
         start_step = checkpoint['steps'] + 1
     else:
+        assert run_to_first_save, "should have loaded ckpt" # can remove later.
         os.makedirs(model_save_dir, exist_ok=True)
         start_step = 0
         checkpoint = {
@@ -443,6 +452,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
             val_writer.add_scalar(f"Cross Entropy Loss", out['val'], step)
             t_last = timer()
             train_writer.flush()
+            volume.commit()
 
         # checkpointing
         if step > 0 and step % n_steps_before_checkpoint == 0:
@@ -450,6 +460,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
             checkpoint['steps'] = step
             checkpoint['val_loss'] = out['val']
             torch.save(checkpoint, model_save_dir / model_filename)
+            volume.commit()
             if run_to_first_save:
                 print ("Stopping early...")
                 break
@@ -463,6 +474,37 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     # print (generate(model, n_new_tokens))
     return out['val'], hparams
 
+###############################
+### Web App for Tensorboard ###
+###############################
+@app.function(
+    image=image, # Without this, dataset crashes with "torch not found"
+    volumes={volume_path: volume})
+@modal.wsgi_app()
+def monitor_training():
+    # if FLAGS.monitor_experiment_name is not None:
+        # monitor_path = log_path / FLAGS.monitor_experiment_name
+    # else:
+        # log_paths = glob.glob(f"{log_path}/*")
+        # latest_log_path = max(log_paths, key=os.path.getctime)
+        # monitor_path = Path(latest_log_path)
+    log_paths = glob.glob(f"{log_path}/*")
+    latest_log_path = max(log_paths, key=os.path.getctime)
+    monitor_path = Path(latest_log_path)
+    print_banner(f"Monitoring: {monitor_path.name}")
+
+    board = tensorboard.program.TensorBoard()
+    board.configure(logdir=str(monitor_path))
+    (data_provider, deprecated_multiplexer) = board._make_data_provider()
+    wsgi_app = tensorboard.backend.application.TensorBoardWSGIApp(
+        board.flags,
+        board.plugin_loaders,
+        data_provider,
+        board.assets_zip_provider,
+        deprecated_multiplexer,
+    )
+    return wsgi_app
+
 ######################################
 ### Model Inferece for Web Serving ###
 ######################################
@@ -474,17 +516,16 @@ class ModelInference:
     @modal.enter()
     def load_model(self):
         # Latest model:
-        # checkpoint = torch.load(volume_path / model_filename)
-        # Fixed to medium model out:
-        checkpoint = torch.load(medium_model_path)
+        save_model_dirs = glob.glob(f"{save_path}/*")
+        latest_model_dir = max(save_model_dirs, key=os.path.getctime)
+        print (f"Loading model from: {latest_model_dir}")
+        checkpoint = torch.load(f"{latest_model_dir}/{best_model_filename}")
         hparams = checkpoint['hparams']
 
+        # Reconstruct encode/decode
         chars = checkpoint['chars']
         vocab_size = len(chars)
-        stoi = {c:i for i,c in enumerate(chars)}
-        itos = {i:c for i,c in enumerate(chars)}
-        self.encode = lambda s: [stoi[c] for c in s]
-        self.decode = lambda l: [itos[i] for i in l]
+        self.encode, self.decode = build_encode_decode(chars)
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -497,7 +538,7 @@ class ModelInference:
         n_new_tokens = 1000
         encoded_prompt = self.encode(prompt)
         torch_input = torch.tensor(encoded_prompt, dtype=torch.long)
-        torch_input = torch_input.view(1, len(torch_input)) # Batch dim.
+        torch_input = torch_input.view(1, len(torch_input)) # Add batch dim.
         torch_input = torch_input.to(self.device)
 
         gen_out = self.model.generate(torch_input, n_new_tokens)[0] # 0th batch
@@ -528,14 +569,13 @@ def fastapi_app():
     # Call out to the inference in a separate Modal environment with a GPU
     def go(text=""):
         if not text:
-            text = example_prompts[0]
-        # return text[::-1]
+            text = "\n"
         return ModelInference().generate.remote(text)
 
     example_prompts = [
-        f"Where art thou Lucas?",
-        f"Were that it was",
-        f"Macbeth, fair is foul, foul is fair, but who are you?",
+        f"DUKE OF YORK:\nWhere art thou Lucas?",
+        f"ROMEO:\nWhat is a man?",
+        f"CLARENCE:\nFair is foul and foul is fair, but who are you?",
         f"Brevity is the soul of wit, so what is the soul of foolishness?",
     ]
 
@@ -615,12 +655,12 @@ def main():
 
     # Build list of hyperparameters to train & validate
     hparams_list = []
-    # h_options = (1, default_hparams.n_heads)
-    # c_options = (8, default_hparams.context_size)
-    # d_options = (0.0, default_hparams.dropout)
-    h_options = (default_hparams.n_heads,)
-    c_options = (8, default_hparams.context_size,)
-    d_options = (default_hparams.dropout,)
+    h_options = (1, default_hparams.n_heads)
+    c_options = (8, default_hparams.context_size)
+    d_options = (0.1, default_hparams.dropout)
+    # h_options = (default_hparams.n_heads,)
+    # c_options = (8, default_hparams.context_size,)
+    # d_options = (default_hparams.dropout,)
     for n_heads in h_options:
         for context_size in c_options:
             for dropout in d_options:
@@ -632,6 +672,7 @@ def main():
     # Run training for each hyperparameter setting
     results = []
     stop_early = True
+    print (f"Testing {len(hparams_list)} hyperparameter settings")
     for result in train_model.starmap(
         [(h, experiment_name, stop_early) for h in hparams_list]):
         results.append(result)
