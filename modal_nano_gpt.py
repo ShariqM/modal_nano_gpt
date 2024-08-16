@@ -2,20 +2,33 @@ import modal
 from modal import Image, build, enter, method
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
+# import argparse
+# parser = argparse.ArgumentParser(description="Pass args to monitor")
+# parser.add_argument(
+    # "-c",
+    # type=str,
+    # dest="monitor_experiment_name",
+    # default=None,
+    # required=False,
+# )
+# FLAGS = parser.parse_args()
+
+
 ##############
 ### Setup ####
 ##############
-size = 'tiny'   # CPU
-# size = 'small'  # CPU/GPU
+# size = 'tiny'   # CPU
+size = 'small'  # CPU/GPU
 # size = 'medium' # GPU
 
 # gpu = None
-# gpu = "T4"
-gpu = "A10G"
+gpu = "T4"
+# gpu = "A10G"
 
 timeout = 20 * 60  # 20 minutes
 # timeout =  5 * 60  # Default 5 minutes
@@ -49,6 +62,7 @@ model_filename = "nano_gpt_model.pt"
 # model_filename = "nano_gpt_model_v0.2.pt"
 medium_model_path = volume_path / "medium" / model_filename
 log_path = volume_path / "logs"
+save_path = volume_path / "models"
 
 web_app = FastAPI()
 assets_path = Path(__file__).parent / "assets"
@@ -66,7 +80,7 @@ image = (
 with image.imports():
     import numpy as np
     import os
-    from datetime import datetime
+    import glob
     from timeit import default_timer as timer
 
     import torch
@@ -75,6 +89,11 @@ with image.imports():
 
     import tensorboard
     from torch.utils.tensorboard import SummaryWriter
+
+def print_banner(string):
+    print ('#' * (len(string) + 8))
+    print (f'### {string} ###')
+    print ('#' * (len(string) + 8))
 
 ###############
 ### Dataset ###
@@ -277,11 +296,20 @@ class AttentionModel(nn.Module):
     image=image, # Without this, dataset crashes with "torch not found"
     volumes={volume_path: volume})
 @modal.wsgi_app()
-def monitor():
-    import tensorboard
+def monitor_training():
+    # if FLAGS.monitor_experiment_name is not None:
+        # monitor_path = log_path / FLAGS.monitor_experiment_name
+    # else:
+        # log_paths = glob.glob(f"{log_path}/*")
+        # latest_log_path = max(log_paths, key=os.path.getctime)
+        # monitor_path = Path(latest_log_path)
+    log_paths = glob.glob(f"{log_path}/*")
+    latest_log_path = max(log_paths, key=os.path.getctime)
+    monitor_path = Path(latest_log_path)
+    print_banner(f"Monitoring: {monitor_path.name}")
 
     board = tensorboard.program.TensorBoard()
-    board.configure(logdir=str(log_path))
+    board.configure(logdir=str(monitor_path))
     (data_provider, deprecated_multiplexer) = board._make_data_provider()
     wsgi_app = tensorboard.backend.application.TensorBoardWSGIApp(
         board.flags,
@@ -292,17 +320,13 @@ def monitor():
     )
     return wsgi_app
 
-def print_banner(string):
-    print ('#' * (len(string) + 8))
-    print (f'### {string} ###')
-    print ('#' * (len(string) + 8))
 
 @app.function(
     image=image,
     volumes={volume_path: volume},
     gpu=gpu,
     timeout=timeout)
-def modal_start():
+def train_model(hparams, experiment_name, run_to_first_save=False):
     #######################
     ### Hyperparameters ###
     #######################
@@ -311,18 +335,18 @@ def modal_start():
     n_steps = 5000
     n_eval_steps = 100
     n_steps_before_eval = int(n_steps/10.) # eval every 10% of training
+    n_steps_before_checkpoint = int(n_steps/5.) # checkpoint every 20% of
     train_percent = 0.9
     # learning_rate = 1e-2
     # learning_rate = 1e-3
     learning_rate = 3e-4
 
     # Model params
-    hparams = ModelHyperparameters()
     assert (hparams.n_embed % hparams.n_heads == 0), (
             "n_embed must be divisible by n_heads")
     # Misc
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print_banner(f'Remote Device: {device} // {gpu}')
+    print_banner(f'Remote Device: {device} // GPU: {gpu}')
 
     #########################
     ### Data & Model prep ###
@@ -334,6 +358,7 @@ def modal_start():
     # Build Model
     model = AttentionModel(dataset.vocab_size, hparams, device)
     m = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     num_parameters = sum(p.numel() for p in model.parameters())
     print_banner(f"Num parameters: {num_parameters}")
 
@@ -351,20 +376,51 @@ def modal_start():
     n_new_tokens = 100
     generate(model, n_new_tokens) # ignore return val
 
+    ####################################
+    ### Logging & Checkpointing prep ###
+    ####################################
+    # experiment_name is used twice intentionally below:
+    # Put experiment in model name so we can see it on Tensorboard
+    model_name = (f"{experiment_name}"
+        f"_context={hparams.context_size}_n_heads={hparams.n_heads}"
+        f"_dropout={hparams.dropout}")
+    print_banner(model_name)
+    # Create a experiment name folder so Tensorboard can group by experiment
+    model_log_dir = log_path / f"{experiment_name}/{model_name}"
+    os.makedirs(model_log_dir, exist_ok=True)
+    train_writer = SummaryWriter(log_dir=f"{model_log_dir}/train")
+    val_writer   = SummaryWriter(log_dir=f"{model_log_dir}/val")
+    # Log hparams
+    pretty_hparams_str = ""
+    for k,v in hparams.__dict__.items():
+        pretty_hparams_str += f"{k}: {v}\n"
+    pretty_hparams_str += f"Num parameters: {num_parameters}"
+    train_writer.add_text("Hyperparameters", pretty_hparams_str)
+
+    # Load & Checkpointing code
+    model_save_dir = save_path / model_name
+    if model_save_dir.exists():
+        print ("Loading model from checkpiont...")
+        checkpoint = torch.load(str(model_save_dir / model_filename))
+        model.load_state_dict(checkpoint['model'])
+        start_step = checkpoint['steps'] + 1
+    else:
+        os.makedirs(model_save_dir, exist_ok=True)
+        start_step = 0
+        checkpoint = {
+            'model': model.state_dict(),
+            'chars': dataset.chars,
+            'optimizer': optimizer.state_dict(),
+            'val_loss': float('inf'),
+            'steps': start_step,
+            'hparams': hparams,
+        }
+
     ################
     ### Training ###
     ################
-    experiment_name = f"E{datetime.now().strftime('%Y-%m%d-%H%M%S.%f')}"
-    print_banner(experiment_name)
-    log_dir = log_path / experiment_name
-    os.makedirs(log_dir)
-    train_writer = SummaryWriter(log_dir=f"{log_dir}/train")
-    # TODO: Add validation writer
-    # val_writer = tf.summary.create_file_writer(f"{log_dir}/val")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     t_last = timer()
-    for step in range(n_steps):
+    for step in range(start_step, n_steps+1):
         # sample
         xb, yb = dataset.get_batch('train')
 
@@ -377,43 +433,35 @@ def modal_start():
         # logging
         train_writer.add_scalar(f"Cross Entropy Loss", loss.item(), step)
 
+        # eval
         if step % n_steps_before_eval == 0:
             out = dataset.eval_model(model)
             runtime_s = timer() - t_last
             print (f"{step:5d}) // {runtime_s:>5.2f}s"
                 f" // Train Loss: {out['train']:.2f} // Val Loss:"
                 f" {out['val']:.2f}")
+            val_writer.add_scalar(f"Cross Entropy Loss", out['val'], step)
             t_last = timer()
             train_writer.flush()
 
+        # checkpointing
+        if step > 0 and step % n_steps_before_checkpoint == 0:
+            print (f"Saving model to {model_save_dir}")
+            checkpoint['steps'] = step
+            checkpoint['val_loss'] = out['val']
+            torch.save(checkpoint, model_save_dir / model_filename)
+            if run_to_first_save:
+                print ("Stopping early...")
+                break
 
-    out = dataset.eval_model(model)
-    runtime_s = timer() - t_last
-    print (f"Final) // {runtime_s:>5.2f}"
-        f" // Train Loss: {out['train']:.2f} // Val Loss:"
-        f" {out['val']:.2f}")
-    print (f"Num parameters: {num_parameters}")
-
-    ##################
-    ### Save Model ###
-    ##################
-    print (f"Saving model to {volume_path}")
-    checkpoint = {
-        'model': model.state_dict(),
-        'chars': dataset.chars,
-        'optimizer': optimizer.state_dict(),
-        'val_loss': out['val'],
-        'hparams': hparams,
-    }
-    torch.save(checkpoint, volume_path / model_filename)
-
-
-    ##################
-    ### Generation ###
-    ##################
-    n_new_tokens = 1000
-    print ("After Training Generation: ", generate(model, n_new_tokens))
-    return -1
+    # ##################
+    # ### Generation ###
+    # ##################
+    # n_new_tokens = 1000
+    # print ('')
+    # print_banner("Sample Generation")
+    # print (generate(model, n_new_tokens))
+    return out['val'], hparams
 
 ######################################
 ### Model Inferece for Web Serving ###
@@ -562,6 +610,36 @@ def fastapi_app():
 
 @app.local_entrypoint()
 def main():
-    ret = modal_start.remote()
-    print ('returned: ', ret)
-    print ('not run on modal')
+    experiment_name = f"E{datetime.now().strftime('%Y-%m%d-%H%M%S.%f')}"
+    default_hparams = ModelHyperparameters()
+
+    # Build list of hyperparameters to train & validate
+    hparams_list = []
+    # h_options = (1, default_hparams.n_heads)
+    # c_options = (8, default_hparams.context_size)
+    # d_options = (0.0, default_hparams.dropout)
+    h_options = (default_hparams.n_heads,)
+    c_options = (8, default_hparams.context_size,)
+    d_options = (default_hparams.dropout,)
+    for n_heads in h_options:
+        for context_size in c_options:
+            for dropout in d_options:
+                hparams_list.append(ModelHyperparameters(
+                    n_heads=n_heads,
+                    context_size=context_size,
+                    dropout=dropout))
+
+    # Run training for each hyperparameter setting
+    results = []
+    stop_early = True
+    for result in train_model.starmap(
+        [(h, experiment_name, stop_early) for h in hparams_list]):
+        results.append(result)
+        print (f"\tSingle result: {result}")
+
+    best_result = min(results, key=lambda x: x[0])
+    print (f"Best Result: {best_result}")
+    best_hparams = best_result[1]
+
+    # Finish training with best hyperparameters
+    train_model.remote(best_hparams, experiment_name)
