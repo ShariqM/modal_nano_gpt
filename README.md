@@ -1,6 +1,10 @@
 # Train an LLM and serve it via FastAPI using Modal
 LLM Training is based on [Karpathy's GPT from scratch tutorial](https://www.youtube.com/watch?v=kCc8FmEb1nY&t=5976s).
 
+# Data
+The data is Shakespeare text from Project Gutenberg. Downloaded from
+[here](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt).
+
 # Use
 ## Train model
 modal run modal_nano_gpt
