@@ -28,28 +28,19 @@ from datetime import datetime
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
-# import argparse
-# parser = argparse.ArgumentParser(description="Pass args to monitor")
-# parser.add_argument(
-    # "-c",
-    # type=str,
-    # dest="monitor_experiment_name",
-    # default=None,
-    # required=False,
-# )
-# FLAGS = parser.parse_args()
-
+from model import AttentionModel, Dataset
+from utils import build_encode_decode, print_banner
 
 ##############
 ### Setup ####
 ##############
 # size = 'tiny'   # CPU
-size = 'small'  # CPU/GPU
-# size = 'medium' # GPU
+# size = 'small'  # CPU/GPU
+size = 'medium' # GPU
 
-# gpu = None
-gpu = "T4"
-# gpu = "A10G"
+# gpu = None # CPU
+# gpu = "T4"
+gpu = "A10G"
 
 timeout = 20 * 60  # 20 minutes
 # timeout =  5 * 60  # Default 5 minutes
@@ -88,7 +79,7 @@ web_app = FastAPI()
 assets_path = Path(__file__).parent / "assets"
 
 app = modal.App("modal_nano_gpt")
-image = (
+torch_image = (
     Image.debian_slim(python_version="3.11")
     .pip_install(
         "torch==2.1.2",
@@ -97,7 +88,7 @@ image = (
     )
 )
 
-with image.imports():
+with torch_image.imports():
     import numpy as np
     import os
     import glob
@@ -110,219 +101,9 @@ with image.imports():
     import tensorboard
     from torch.utils.tensorboard import SummaryWriter
 
-def print_banner(string):
-    print ('#' * (len(string) + 8))
-    print (f'### {string} ###')
-    print ('#' * (len(string) + 8))
-
-###############
-### Dataset ###
-###############
-def build_encode_decode(chars):
-    stoi = {c:i for i,c in enumerate(chars)}
-    itos = {i:c for i,c in enumerate(chars)}
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: [itos[i] for i in l]
-    return encode, decode
-
-@app.cls(
-    image=image,
-    volumes={volume_path: volume},
-    gpu=gpu,
-    timeout=timeout)
-class Dataset(object):
-    """Manage text dataset and encoding & decoding."""
-
-    def __init__(self, txt_filename, train_percent, batch_size,
-                 context_size, n_eval_steps, device):
-        with open(volume_path / txt_filename, 'r', encoding='utf-8') as f:
-            text = f.read()
-        self.device = device
-        self.batch_size = batch_size
-        self.context_size = context_size
-        self.n_eval_steps = n_eval_steps
-        assert (train_percent > 0.0) and (train_percent < 1.0), (
-            "train_percent must be in (0,1)")
-
-        self.chars = sorted(list(set(text)))
-        self.vocab_size = len(self.chars)
-        print (f"Vocab Size: {self.vocab_size}")
-        print ('Unique letters: ', ''.join(self.chars))
-
-        self.encode, self.decode = build_encode_decode(self.chars)
-        self.newline_encoded = self.encode(['\n'])[0]
-
-        # Train/Validation.
-        data = torch.tensor(self.encode(text), dtype=torch.long)
-        n = len(data)
-        self.train_data = data[:int(train_percent*n)]
-        self.val_data = data[int(train_percent*n):]
-
-    def get_batch(self, split):
-        data = self.train_data if split == 'train' else self.val_data
-
-        starts = torch.randint(
-            len(data) - self.context_size, (self.batch_size,))
-        x = torch.stack(
-            [data[start:start+self.context_size] for start in starts])
-        y = torch.stack(
-            [data[start+1:start+self.context_size+1] for start in starts])
-        return x.to(self.device), y.to(self.device)
-
-    @torch.no_grad()
-    def eval_model(self, model):
-        out = {}
-        model.eval()
-        for split in ('train', 'val'):
-            losses = torch.zeros(self.n_eval_steps)
-            for k in range(self.n_eval_steps):
-                xb, yb = self.get_batch(split)
-                logits, loss = model.forward(xb, yb) # Modal: Why need forward?
-                losses[k] = loss
-            out[split] = losses.mean()
-        model.train()
-        return out
-
-#######################
-### Attention Model ###
-#######################
-class MultiHeadFast(nn.Module):
-    """Multihead self-attention."""
-
-    def __init__(self, hparams, input_size):
-        super().__init__()
-        self.input_size = input_size
-        self.head_size = input_size // hparams.n_heads
-        self.n_heads = hparams.n_heads
-        self.dropout = hparams.dropout
-
-        # Parallel Head calculation
-        self.qkv_proj = nn.Linear(input_size, 3 * input_size, bias=False)
-        self.use_flash_attention = (
-            hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
-        self.register_buffer('tril',
-            torch.tril(
-                torch.ones(hparams.context_size, hparams.context_size)
-                .view(1, 1, hparams.context_size, hparams.context_size)))
-        self.head_dropout = nn.Dropout(hparams.dropout)
-
-        # Multi Head operaitons
-        self.proj = nn.Linear(input_size, input_size)
-        self.out_dropout = nn.Dropout(hparams.dropout)
-
-    def forward(self, x):
-        B, T, C = x.shape
-
-        # QKV for all heads
-        qkv = self.qkv_proj(x) # bt(3i)
-        q, k, v = qkv.split(self.input_size, dim=-1)
-
-        # Split heads
-        q = q.view(B, T, self.n_heads, -1).transpose(1, 2) # bnth
-        k = k.view(B, T, self.n_heads, -1).transpose(1, 2) # bnth
-        v = v.view(B, T, self.n_heads, -1).transpose(1, 2) # bnth
-
-        if self.use_flash_attention:
-            heads_out = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout,
-                is_causal=True)
-        else:
-            weight = torch.einsum("bnth,bnuh->bntu", q, k)
-            weight /= np.sqrt(self.head_size)
-            weight = weight.masked_fill(self.tril[:,:,:T,:T] == 0, float('-inf'))
-            dist = F.softmax(weight, dim=-1)
-            dist = self.head_dropout(dist)
-
-            heads_out = torch.einsum("bntu,bnuh->bnth", dist, v)
-
-        multi_head_out = heads_out.transpose(1, 2).reshape(B, T, C) # bth
-        return self.out_dropout(self.proj(multi_head_out))
-
-class MLP(nn.Module):
-    """ Multi-Layer Perception (last ops of each block)."""
-
-    def __init__(self, hparams, input_size):
-        super().__init__()
-        self.net = nn.Sequential(
-                nn.Linear(input_size, 4 * input_size),
-                nn.ReLU(),
-                nn.Linear(4 * input_size, input_size),
-                nn.Dropout(hparams.dropout))
-
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    def __init__(self, hparams):
-        super().__init__()
-        self.sa_heads = MultiHeadFast(hparams, hparams.n_embed)
-        self.mlp = MLP(hparams, hparams.n_embed)
-        self.ln1 = nn.LayerNorm(hparams.n_embed)
-        self.ln2 = nn.LayerNorm(hparams.n_embed)
-
-    def forward(self, x):
-        x = x + self.sa_heads(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
-        return x
-
-@app.cls(
-    image=image,
-    volumes={volume_path: volume},
-    gpu=gpu,
-    timeout=timeout)
-class AttentionModel(nn.Module):
-    def __init__(self, vocab_size, hparams, device):
-        super().__init__()
-        self.context_size = hparams.context_size
-        self.device = device
-
-        self.token_embedding_table = nn.Embedding(
-                vocab_size, hparams.n_embed, device=device)
-        self.pos_embedding_table = nn.Embedding(
-                hparams.context_size, hparams.n_embed)
-        self.blocks = nn.Sequential(
-            *[Block(hparams) for _ in range(hparams.n_blocks)])
-
-        self.ln_f = nn.LayerNorm(hparams.n_embed)
-        self.lm_head = nn.Linear(hparams.n_embed, vocab_size)
-
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        # idx - (B, T)
-        token_embedding = self.token_embedding_table(idx)
-        position_embedding = self.pos_embedding_table(
-                torch.arange(T, device=self.device))
-        embedding = token_embedding + position_embedding
-        x = self.blocks(embedding)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-
-        if targets is not None:
-            xlogits = logits.view(logits.shape[0] * logits.shape[1], -1)
-            xtargets = targets.view(-1)
-            loss = F.cross_entropy(xlogits, xtargets)
-        else:
-            loss = None
-
-        return logits, loss
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        for i in range(max_new_tokens):
-            logits = self(idx[:, -self.context_size:])[0] # B,T,C
-            logits = logits[:,-1,:] # B,C
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, idx_next], axis=1)
-        return idx
-
-def build_model_name(experiment_name, hparams):
-    return (f"{experiment_name}"
-        f"_context={hparams.context_size}_n_heads={hparams.n_heads}"
-        f"_dropout={hparams.dropout}")
 
 @app.function(
-    image=image,
+    image=torch_image,
     volumes={volume_path: volume},
     gpu=gpu,
     timeout=timeout)
@@ -352,8 +133,11 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     ### Data & Model prep ###
     #########################
     # Construct dataset
-    dataset = Dataset('shakespeare_char.txt', train_percent,
-                      batch_size, hparams.context_size, n_eval_steps, device)
+    txt_filename = 'shakespeare_char.txt'
+    with open(volume_path / txt_filename, 'r', encoding='utf-8') as f:
+        text = f.read()
+    dataset = Dataset(text, train_percent, batch_size, hparams.context_size,
+                      n_eval_steps, device)
 
     # Build Model
     model = AttentionModel(dataset.vocab_size, hparams, device)
@@ -379,7 +163,10 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     ####################################
     ### Logging & Checkpointing prep ###
     ####################################
-    model_name = build_model_name(experiment_name, hparams)
+    model_name =  (f"{experiment_name}"
+        f"_context={hparams.context_size}_n_heads={hparams.n_heads}"
+        f"_dropout={hparams.dropout}")
+
     print_banner(model_name)
     # Create a experiment name folder so Tensorboard can group by experiment
     model_log_dir = log_path / f"{experiment_name}/{model_name}"
@@ -423,6 +210,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
             'val_loss': float('inf'),
             'steps': start_step,
             'hparams': hparams,
+            'finished_training': False,
         }
 
     ################
@@ -457,6 +245,8 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
         # checkpointing
         if step > 0 and step % n_steps_before_checkpoint == 0:
             print (f"Saving model to {model_save_dir}")
+            checkpoint['finished_training'] = (
+                step >= n_steps)  # Mark as finished
             checkpoint['steps'] = step
             checkpoint['val_loss'] = out['val']
             torch.save(checkpoint, model_save_dir / model_filename)
@@ -465,29 +255,20 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
                 print ("Stopping early...")
                 break
 
-    # ##################
-    # ### Generation ###
-    # ##################
-    # n_new_tokens = 1000
-    # print ('')
-    # print_banner("Sample Generation")
-    # print (generate(model, n_new_tokens))
     return out['val'], hparams
 
 ###############################
 ### Web App for Tensorboard ###
 ###############################
 @app.function(
-    image=image, # Without this, dataset crashes with "torch not found"
+    image=torch_image,
     volumes={volume_path: volume})
 @modal.wsgi_app()
 def monitor_training():
-    # if FLAGS.monitor_experiment_name is not None:
-        # monitor_path = log_path / FLAGS.monitor_experiment_name
-    # else:
-        # log_paths = glob.glob(f"{log_path}/*")
-        # latest_log_path = max(log_paths, key=os.path.getctime)
-        # monitor_path = Path(latest_log_path)
+    import time
+    print ("Tensorboard: Waiting 10 seconds for training to start...")
+    time.sleep(10) # Wait for experiment folder to be created by training.
+
     log_paths = glob.glob(f"{log_path}/*")
     latest_log_path = max(log_paths, key=os.path.getctime)
     monitor_path = Path(latest_log_path)
@@ -505,25 +286,50 @@ def monitor_training():
     )
     return wsgi_app
 
-######################################
-### Model Inferece for Web Serving ###
-######################################
+#######################################
+### Model Inference for Web Serving ###
+#######################################
 @app.cls(
-    image=image,
+    image=torch_image,
     volumes={volume_path: volume},
     gpu=gpu)
 class ModelInference:
-    @modal.enter()
-    def load_model(self):
-        # Latest model:
+
+    def load_model_impl(self):
+        # Loop through all model dirs and load the latest available model
         save_model_dirs = glob.glob(f"{save_path}/*")
-        latest_model_dir = max(save_model_dirs, key=os.path.getctime)
-        print (f"Loading model from: {latest_model_dir}")
-        checkpoint = torch.load(f"{latest_model_dir}/{best_model_filename}")
+        sorted_model_dirs = sorted(
+            save_model_dirs, key=os.path.getctime, reverse=True)
+        found_model = True
+        for latest_model_dir in sorted_model_dirs:
+            if self.use_model_dir == latest_model_dir and self.is_fully_trained:
+                return  # Already loaded
+            print (f"Attemping to load from: {latest_model_dir} ...")
+            try:
+                checkpoint = torch.load(
+                    f"{latest_model_dir}/{best_model_filename}")
+                print ("Successfully loaded model.")
+                found_model = True
+                break
+            except Exception as e:
+                print (f"Error loading model: {e}")
+        if not found_model:
+            raise Exception(f"No models ready for serving.")
+
+        # Model loaded successfully. Print info about the model
+        # Print info about the model
+        self.use_model_dir = latest_model_dir
         hparams = checkpoint['hparams']
+        chars = checkpoint['chars']
+        steps = checkpoint['steps']
+        val_loss = checkpoint['val_loss']
+        self.is_fully_trained = checkpoint['finished_training']
+
+        print (f"Loaded model with {steps} train steps "
+            f" and val loss of {val_loss:.2f}"
+            f" (fully_trained={self.is_fully_trained}")
 
         # Reconstruct encode/decode
-        chars = checkpoint['chars']
         vocab_size = len(chars)
         self.encode, self.decode = build_encode_decode(chars)
 
@@ -533,8 +339,16 @@ class ModelInference:
         self.model.load_state_dict(checkpoint['model'])
         self.model.to(self.device)
 
+    @modal.enter()
+    def load_model(self):
+        self.use_model_dir = None
+        self.is_fully_trained = False
+        self.load_model_impl()
+
     @modal.method()
     def generate(self, prompt):
+        self.load_model_impl() # Will load updated model if aviailable, o/w no op.
+
         n_new_tokens = 1000
         encoded_prompt = self.encode(prompt)
         torch_input = torch.tensor(encoded_prompt, dtype=torch.long)
@@ -549,15 +363,14 @@ class ModelInference:
 #######################
 ### Web Application ###
 #######################
-@app.function(image=image) # Why do I need this image? Torch again.
+@app.function(image=torch_image)
 @modal.web_endpoint(method="POST")
 def web_generate(item: dict):
     output = ModelInference().generate.remote(item['prompt'])
     return {'web_generate': output}
-    # return {'web_generate': f"Hello {x}!"}
 
 @app.function(
-    image=image,
+    image=torch_image,
     concurrency_limit=3,
     mounts=[modal.Mount.from_local_dir(assets_path, remote_path="/assets")],
 )
@@ -676,10 +489,10 @@ def main():
     for result in train_model.starmap(
         [(h, experiment_name, stop_early) for h in hparams_list]):
         results.append(result)
-        print (f"\tSingle result: {result}")
+        print (f"\tEarly stop val loss result: {result}")
 
     best_result = min(results, key=lambda x: x[0])
-    print (f"Best Result: {best_result}")
+    print (f"Best early stop val loss result: {best_result}")
     best_hparams = best_result[1]
 
     # Finish training with best hyperparameters
