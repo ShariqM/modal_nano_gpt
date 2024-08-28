@@ -1,34 +1,12 @@
-# ---
-# Hyperparameter optimization of LLM Training with Modal
-#
-# Trains an GPT LLM model from scratch on Shakespeare text data.
-#
-# A single experiment trains multiple models with different hyperparameters.
-# The experiment name is 'E' followed by a datetimestamp.
-#
-# Logging:
-# volume/logs/E2024-01-01-000000.000000/
-#   E2024-01-01-000000.000000_context=8_n_heads=1_dropout=0.0/train
-#
-# Model Checkpoints:
-# volume/models/E2024-01-01-000000.000000/
-#  E2024-01-01-000000.000000_context=8_n_heads=1_dropout=0.0/nano_gpt_model.pt
-#
-# There will best a symlink that links to the best hyperparameter model:
-# volume/models/E2024-01-01-000000.000000/best_nano_gpt_model.pt
-#
-# When serving the model this symlink will be used.
-# ---
-
 # # LLM Training with Hyperparameter Optimization
 #
-# When you want an LLM tailored to your specific data there are three options
+# When you want an LLM tailored to your specific data there are three options.
 # The easiest is [Prompt Engineering](https://en.wikipedia.org/wiki/Prompt_engineering)
-# but the quality of the results isn't very high. The next level is
+# but the quality of the results aren't very high. The next option is
 # [fine-tuning](https://modal.com/docs/examples/llm-finetuning) an existing
-# LLM on your dataset which more involved but allows for better
-# results. The final level is training an LLM from scratch which is the most
-# involved but allows for the highest caliber results. In addition you may
+# LLM on your dataset which is more involved but allows for better
+# results. The final option is training an LLM from scratch which is the most
+# involved but may allow for the highest caliber results. In addition, you may
 # be able to shrink the model considerably and save money on inference costs
 # after training.
 #
@@ -36,7 +14,8 @@
 # 8 LLM's in parallel with different hyperparameters and then select the best
 # one. Sound challenging? Modal makes it easy.
 #
-# ## Basic Setup
+# ## Training
+# ### Basic Setup
 # First we will import modal, the fastapi for serving tenorboard, the torch
 # LLM model, and a dataset class. The torch model is a nano GPT style model
 # via Karpathy and available [here](https://github.com/ShariqM/modal_nano_gpt/blob/master/model.py).
@@ -53,13 +32,14 @@ from fastapi.responses import FileResponse
 
 from model import AttentionModel, Dataset
 
-# We'll use an A10G GPU for training which will keep costs under ~$1. Since
-# The default timeout is only 5 minutes so let's increase it to 20 minutes.
+# We'll use an A10G GPU for training which will train the entire model in 10
+# minutes and keep costs under ~$1. Since the default timeout is only 5 minutes
+# we will also increase that to 20 minutes.
 gpu = "A10G"
-timeout = 20 * 60  # 20 minutes
+timeout_s = 20 * 60  # 20 minutes
 
 
-# ## Create a Volume
+# ### Create a Volume
 # Since we'll be coordinating training across multiple machines we'll use a
 # single [distributed volume](https://modal.com/docs/guide/volumes)
 # to store the dataset, checkpointed models, and logs.
@@ -70,10 +50,7 @@ best_model_filename = "best_nano_gpt_model.pt"
 log_path = volume_path / "logs"
 save_path = volume_path / "models"
 
-web_app = FastAPI()
-assets_path = Path(__file__).parent / "assets"
-
-# ## Define a container image
+# ### Define a container image
 # The container image will be based on the latest Debian slim image with torch
 # for training, gradio for serving a web interface, and tensorboard for
 # monitoring training.
@@ -106,7 +83,7 @@ def print_banner(string):
     print (f'### {string} ###')
     print ('#' * (len(string) + 8))
 
-# ## Training Function
+# ### Training Function
 
 # Here we will define the training function making sure to include the image,
 # volume, gpu, and timeout parameters.
@@ -118,7 +95,7 @@ def print_banner(string):
     image=torch_image,
     volumes={volume_path: volume},
     gpu=gpu,
-    timeout=timeout)
+    timeout=timeout_s)
 def train_model(hparams, experiment_name, run_to_first_save=False):
     ##########################################
     ### Optimization, Data, and Model prep ###
@@ -259,7 +236,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
 
     return out['val'], hparams
 
-# ## Main Entry Point
+# ### Main Entry Point
 # The main entry point will run the hyperparameter optimization training.
 # First, we'll specify the default hyperparameters for the model, taken from
 # [Karpathy's biggest model](https://www.youtube.com/watch?v=kCc8FmEb1nY&t=5976s),
@@ -316,7 +293,7 @@ def main():
     # Finish training with best hparams
     train_model.remote(best_hparams, experiment_name)
 
-# ## Bonus 1: Tensorboard Web App
+# ### Bonus: Tensorboard Web App
 # Similar to [this example](https://modal.com/docs/examples/flan_t5_finetune#:~:text=Monitoring%20Finetuning%20with-,Tensorboard,-Tensorboard%20is%20an)
 # we will create a WSGI web app for serving the tensorboard logs of our model
 # training.
@@ -349,14 +326,21 @@ def monitor_training():
     )
     return wsgi_app
 
-# ## Bonus 2: Inference class for serving the model
+# ## Web Serving (another bonus)
+# ### Setup
+# Initialize some variables for web seving:
+web_app = FastAPI()
+assets_path = Path(__file__).parent / "assets"
+
+# ### Inference class
 # Similar to [this example](https://modal.com/docs/examples/dreambooth_app#:~:text=Running%20our-,model,-To%20generate%20images)
 # we will create a class for running inference on the trained model.
 #
 # The idea will be to find the latest experiment that has best
 # model checkpoint and to load that model for inference. In case
-# training is ongiong, we will check for updated models on the fly
+# training is still ongoing, we will check for updated models on the fly
 # and load them if available.
+
 @app.cls(
     image=torch_image,
     volumes={volume_path: volume},
@@ -544,3 +528,8 @@ def fastapi_app():
         blocks=interface,
         path="/",
     )
+
+# We hope you enjoyed this example. Message us on Slack if you need help!
+
+# ## Further Examples
+# [Scale out](https://modal.com/docs/guide/scale#parallel-execution-of-inputs)
