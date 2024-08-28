@@ -436,6 +436,7 @@ class ModelInference:
 # e.g.
 # curl -X POST -H 'Content-Type: application/json' --data-binary '{"prompt":
 # "\n"}' https://shariqm--modal-nano-gpt-web-generate-dev.modal.run
+
 # Similar to [this example](https://modal.com/docs/examples/basic_web).
 
 @app.function(image=torch_image)
