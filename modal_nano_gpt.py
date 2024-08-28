@@ -334,9 +334,14 @@ def monitor_training():
     )
     return wsgi_app
 
+# After training your Tensorboard will look something like this:
+# [[https://github.com/shariqm/modal_nano_gpt/blob/master/images/tensorboard.png|alt=tensorboard]]
+# Notice that there are 8 models training, and the one with the lowest
+# validation loss at step 1000 continues training to 5000 steps.
+
 # ## Web Serving (another bonus)
 # ### Setup
-# Initialize some variables for web seving:
+# Initialize some variables for web serving:
 
 web_app = FastAPI()
 assets_path = Path(__file__).parent / "assets"

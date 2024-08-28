@@ -3,4 +3,5 @@ archive/
 *.swp
 .DS_STORE
 
+# For GitHub wiki page.gT
 modal_nano_gpt_markdown.py
