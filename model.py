@@ -1,3 +1,8 @@
+# Transformer model based on
+# [Attention Is All You Need](https://proceedings.neurips.cc/paper_files/paper/2017/file/3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf)
+
+# Built using ideas from Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT)
+#
 import numpy as np
 
 import torch
@@ -29,6 +34,7 @@ class Dataset(object):
         self.chars = sorted(list(set(text)))
         self.vocab_size = len(self.chars)
 
+        # Encoding/Decoding for transforming text to tensor.
         self.encode, self.decode = build_encode_decode(self.chars)
         self.newline_encoded = self.encode(['\n'])[0]
 
@@ -39,6 +45,7 @@ class Dataset(object):
         self.val_data = data[int(train_percent*n):]
 
     def get_batch(self, split):
+        """Get a batch of train or validation data."""
         data = self.train_data if split == 'train' else self.val_data
 
         starts = torch.randint(
@@ -51,6 +58,7 @@ class Dataset(object):
 
     @torch.no_grad()
     def eval_model(self, model):
+        """Evaluate model on train and validation data."""
         out = {}
         model.eval()
         for split in ('train', 'val'):
@@ -119,7 +127,7 @@ class MultiHeadFast(nn.Module):
         return self.out_dropout(self.proj(multi_head_out))
 
 class MLP(nn.Module):
-    """ Multi-Layer Perception (last ops of each block)."""
+    """ Multi-Layer Perception (last ff ops of each block)."""
 
     def __init__(self, hparams, input_size):
         super().__init__()
@@ -133,8 +141,10 @@ class MLP(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
+    """Transformer block."""
     def __init__(self, hparams):
         super().__init__()
+        # Represents right grey decoder box in Fig. 1 of the paper.
         self.sa_heads = MultiHeadFast(hparams, hparams.n_embed)
         self.mlp = MLP(hparams, hparams.n_embed)
         self.ln1 = nn.LayerNorm(hparams.n_embed)
@@ -164,10 +174,12 @@ class AttentionModel(nn.Module):
         self.ln_f = nn.LayerNorm(hparams.n_embed)
         self.lm_head = nn.Linear(hparams.n_embed, vocab_size)
 
-    def forward(self, idx, targets=None):
-        B, T = idx.shape
-        # idx - (B, T)
-        token_embedding = self.token_embedding_table(idx)
+    def forward(self, input_tokens, targets=None):
+        # Forward pass of the model.
+
+        B, T = input_tokens.shape
+        # input_tokens - (B, T)
+        token_embedding = self.token_embedding_table(input_tokens)
         position_embedding = self.pos_embedding_table(
                 torch.arange(T, device=self.device))
         embedding = token_embedding + position_embedding
@@ -185,11 +197,12 @@ class AttentionModel(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
+    def generate(self, input_tokens, max_new_tokens):
+        # Generate new tokens given a prompt input_tokens.
         for i in range(max_new_tokens):
-            logits = self(idx[:, -self.context_size:])[0] # B,T,C
+            logits = self(input_tokens[:, -self.context_size:])[0] # B,T,C
             logits = logits[:,-1,:] # B,C
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, idx_next], axis=1)
-        return idx
+            next_token = torch.multinomial(probs, num_samples=1)
+            input_tokens = torch.cat([input_tokens, next_token], axis=1)
+        return input_tokens

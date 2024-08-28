@@ -17,3 +17,12 @@ modal serve modal_nano_gpt
 curl -X POST -H 'Content-Type: application/json' --data-binary '{"prompt": "\n"}' https://shariqm--modal-nano-gpt-web-generate-dev.modal.run
 ### Option 2
 Visit https://shariqm--modal-nano-gpt-fastapi-app-dev.modal.run
+
+## TODO
+- Implement better tokenizer, e.g byte pair encoding (BPE)
+- Use bfloat16 for faster training
+- New datasets e.g. Erik's blog or OpenWebText
+- Train a bigger model
+- incorporate multiple GPUs
+- Support loading OpenAI's GPT-2 model
+- Incorporate better generation techniques e.g. nucleus sampling

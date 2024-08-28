@@ -61,7 +61,8 @@ timeout = 20 * 60  # 20 minutes
 
 # ## Create a Volume
 # Since we'll be coordinating training across multiple machines we'll use a
-# single distributed volume to store the dataset, checkpointed models, and logs.
+# single [distributed volume](https://modal.com/docs/guide/volumes)
+# to store the dataset, checkpointed models, and logs.
 volume = modal.Volume.from_name("nano_gpt_volume")
 volume_path = Path("/vol/data")
 model_filename = "nano_gpt_model.pt"
