@@ -4,9 +4,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from utils import build_encode_decode
-
-
 def build_encode_decode(chars):
     stoi = {c:i for i,c in enumerate(chars)}
     itos = {i:c for i,c in enumerate(chars)}
@@ -153,6 +150,9 @@ class AttentionModel(nn.Module):
         super().__init__()
         self.context_size = hparams.context_size
         self.device = device
+        # Sanity check parameters
+        assert (hparams.n_embed % hparams.n_heads == 0), (
+                "n_embed must be divisible by n_heads")
 
         self.token_embedding_table = nn.Embedding(
                 vocab_size, hparams.n_embed, device=device)
