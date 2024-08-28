@@ -1,6 +1,6 @@
 # # LLM Training with Hyperparameter Optimization
 #
-# [[https://github.com/shariqm/modal_nano_gpt/blob/master/images/gradio.png|alt=gradio]]
+# <img src="https://github.com/shariqm/modal_nano_gpt/blob/master/images/shakespeare.png" width=25% height=25% alt='shakespeare'>
 #
 # When you want an LLM tailored to your specific data there are three options.
 # The easiest is [Prompt Engineering](https://en.wikipedia.org/wiki/Prompt_engineering)
