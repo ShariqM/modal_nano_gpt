@@ -548,6 +548,9 @@ def fastapi_app():
         path="/",
     )
 
+# The Gradio app will look something like this:
+# [[https://github.com/shariqm/modal_nano_gpt/blob/master/images/gradio.png|alt=gradio]]
+
 # We hope you enjoyed this example. Message us on Slack if you need help!
 
 # ## Further Examples
