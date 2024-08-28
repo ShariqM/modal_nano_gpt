@@ -2,3 +2,5 @@ archive/
 *.pyc
 *.swp
 .DS_STORE
+
+modal_nano_gpt_markdown.py

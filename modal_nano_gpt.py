@@ -36,7 +36,8 @@ from fastapi.responses import FileResponse
 from model import AttentionModel, Dataset
 
 # We'll use an A10G GPU for training which can train the entire model in 10
-# minutes and keep costs under ~$1. Since the default timeout is only 5 minutes
+# minutes and keep costs under ~$1. Since the default modal function
+# [timeout](https://modal.com/docs/guide/timeouts) is only 5 minutes
 # we need to increase the 20 minutes.
 
 gpu = "A10G"
