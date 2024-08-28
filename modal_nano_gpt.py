@@ -3,23 +3,26 @@
 # When you want an LLM tailored to your specific data there are three options.
 # The easiest is [Prompt Engineering](https://en.wikipedia.org/wiki/Prompt_engineering)
 # but the quality of the results aren't very high. The next option is
-# [fine-tuning](https://modal.com/docs/examples/llm-finetuning) an existing
-# LLM on your dataset which is more involved but allows for better
-# results. The final option is training an LLM from scratch which is the most
-# involved but may allow for the highest caliber results. In addition, you may
-# be able to shrink the model considerably and save money on inference costs
-# after training.
+# [fine-tuning](https://modal.com/docs/examples/llm-finetuning) which is more
+# involved and improves results significantly.  The final option is training an LLM
+# from scratch which is the most involved but may allow for the highest caliber results.
+# In addition, you may be able to shrink the model considerably and save money on inference
+# costs after training.
 #
-# In this example we will explore training from scratch. In fact, we will train
+# In this example we will explore training from scratch. In fact, we'll train
 # 8 LLM's in parallel with different hyperparameters and then select the best
-# one. Sound challenging? Modal makes it easy.
+# one. Along the way we will utlize many Modal utilities: [distributed volumes](https://modal.com/docs/guide/volumes),
+# multiple [web endpoints](https://modal.com/docs/guide/webhooks),
+# and [parallel container execution](https://modal.com/docs/guide/scale#parallel-execution-of-inputs),
+# in essence showing you how to combine multiple techniques into one powerful project. Sound
+# challenging? Modal makes it easy.
 #
 # ## Training
 # ### Basic Setup
-# First we will import modal, the fastapi for serving tenorboard, the torch
+# First we import modal, the fastapi for serving tenorboard, the torch
 # LLM model, and a dataset class. The torch model is a nano GPT style model
 # via Karpathy and available [here](https://github.com/ShariqM/modal_nano_gpt/blob/master/model.py).
-# The dataset class will manage the Shakespeare text data and is available
+# The dataset class manages the Shakespeare text data and is available
 # [here](https://github.com/ShariqM/modal_nano_gpt/blob/master/model.py).
 
 import modal
@@ -32,9 +35,10 @@ from fastapi.responses import FileResponse
 
 from model import AttentionModel, Dataset
 
-# We'll use an A10G GPU for training which will train the entire model in 10
+# We'll use an A10G GPU for training which can train the entire model in 10
 # minutes and keep costs under ~$1. Since the default timeout is only 5 minutes
-# we will also increase that to 20 minutes.
+# we need to increase the 20 minutes.
+
 gpu = "A10G"
 timeout_s = 20 * 60  # 20 minutes
 
@@ -42,7 +46,10 @@ timeout_s = 20 * 60  # 20 minutes
 # ### Create a Volume
 # Since we'll be coordinating training across multiple machines we'll use a
 # single [distributed volume](https://modal.com/docs/guide/volumes)
-# to store the dataset, checkpointed models, and logs.
+# to store the dataset, checkpointed models, and logs. Modal volumes to do
+# not automatically synchronize writes so we'll have to careful to use
+# commit() and reload() calls when appropriate.
+
 volume = modal.Volume.from_name("nano_gpt_volume")
 volume_path = Path("/vol/data")
 model_filename = "nano_gpt_model.pt"
@@ -51,9 +58,10 @@ log_path = volume_path / "logs"
 save_path = volume_path / "models"
 
 # ### Define a container image
-# The container image will be based on the latest Debian slim image with torch
+# The container image is be based on the latest Debian slim image with torch
 # for training, gradio for serving a web interface, and tensorboard for
 # monitoring training.
+
 torch_image = (
     Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -85,22 +93,21 @@ def print_banner(string):
 
 # ### Training Function
 
-# Here we will define the training function making sure to include the image,
+# Here we define the training function making sure to include the image,
 # volume, gpu, and timeout parameters.
 
 # Training consists of specificying optimization parameters, loading the
 # dataset, building the model, setting up logging and checkpointing, and finally
 # the training itself.
+
 @app.function(
     image=torch_image,
     volumes={volume_path: volume},
     gpu=gpu,
     timeout=timeout_s)
 def train_model(hparams, experiment_name, run_to_first_save=False):
-    ##########################################
-    ### Optimization, Data, and Model prep ###
-    ##########################################
-    # Optimization, training, and validation parameters
+
+    # Optimization, Data, and Model prep ###
     batch_size = 64
     n_steps = 5000
     n_eval_steps = 100
@@ -135,9 +142,8 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     num_parameters = sum(p.numel() for p in model.parameters())
     print_banner(f"Num parameters: {num_parameters}")
 
-    ####################################
-    ### Logging & Checkpointing prep ###
-    ####################################
+
+    # Logging & Checkpointing prep
     model_name = (f"{experiment_name}"
         f"_context_size={hparams.context_size}_n_heads={hparams.n_heads}"
         f"_dropout={hparams.dropout}")
@@ -166,11 +172,10 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
         print ("Loading model from checkpiont...")
         checkpoint = torch.load(str(model_save_dir / model_filename))
         if run_to_first_save:
-            # Already done. Someone restarted the job.
-            print ("Stopping early...")
+            print ("Already done. Container Restart? Stopping early...")
             return checkount['val_loss'], hparams
         else:
-            # Create symlink to my (best) model so it's easy to find for web serving.
+            # Create symlink to the best model so it's easy to find for web serving.
             os.symlink(str(model_save_dir / model_filename),
                         str(save_path / experiment_name / best_model_filename))
             volume.commit()  # Commit the symlink.
@@ -192,9 +197,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
             'finished_training': False,
         }
 
-    ################
-    ### Training ###
-    ################
+    # Training
     t_last = timer()
     for step in range(start_step, n_steps+1):
         # sample a batch of data
@@ -206,7 +209,7 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
         loss.backward()
         optimizer.step()
 
-        # log traiing loss
+        # log training loss
         train_writer.add_scalar(f"Cross Entropy Loss", loss.item(), step)
 
         # evaluate model on validation set
@@ -237,10 +240,11 @@ def train_model(hparams, experiment_name, run_to_first_save=False):
     return out['val'], hparams
 
 # ### Main Entry Point
-# The main entry point will run the hyperparameter optimization training.
-# First, we'll specify the default hyperparameters for the model, taken from
+# The main entry point runs coordinates the hyperparameter optimization training.
+# First, we specify the default hyperparameters for the model, taken from
 # [Karpathy's biggest model](https://www.youtube.com/watch?v=kCc8FmEb1nY&t=5976s),
 # which add up to 10 million total parameters.
+
 @dataclass
 class ModelHyperparameters:
     n_heads: int = 6
@@ -249,14 +253,16 @@ class ModelHyperparameters:
     context_size: int = 256
     dropout: float = 0.2
 
-# Next we will define the main entry point which will run the hyperparameter
-# optimization. We will train 8 models with different hyperparameters, varying
-# the number of heads, the context size (called the block size in Karpathy
-# lingo), and the dropout rate.
+# Next we define the main entry point which runs the hyperparameter
+# optimization. It will train 8 models in parallel across 8 containers, each
+# with different hyperparameters, varying the number of heads, the context size
+# (called the block size in Karpathy lingo), and the dropout rate. To run in
+# parallel we need to use the [starmap function](https://modal.com/docs/guide/scale#parallel-execution-of-inputs).
 #
-# We will run the training for each model until the first checkpoint, and then
-# check which one has the best validation loss. We will then finish training the
-# best model and save it to the models directory.
+# Training for each model until the first checkpoint, and then stop early so we
+# can compare the validation losses. Then we'll restart training for the best
+# model and save it to the models directory.
+
 @app.local_entrypoint()
 def main():
     from datetime import datetime
@@ -297,6 +303,7 @@ def main():
 # Similar to [this example](https://modal.com/docs/examples/flan_t5_finetune#:~:text=Monitoring%20Finetuning%20with-,Tensorboard,-Tensorboard%20is%20an)
 # we will create a WSGI web app for serving the tensorboard logs of our model
 # training.
+
 @app.function(
     image=torch_image,
     volumes={volume_path: volume})
@@ -329,6 +336,7 @@ def monitor_training():
 # ## Web Serving (another bonus)
 # ### Setup
 # Initialize some variables for web seving:
+
 web_app = FastAPI()
 assets_path = Path(__file__).parent / "assets"
 
@@ -336,9 +344,9 @@ assets_path = Path(__file__).parent / "assets"
 # Similar to [this example](https://modal.com/docs/examples/dreambooth_app#:~:text=Running%20our-,model,-To%20generate%20images)
 # we will create a class for running inference on the trained model.
 #
-# The idea will be to find the latest experiment that has best
+# The idea is to find the latest experiment that has best
 # model checkpoint and to load that model for inference. In case
-# training is still ongoing, we will check for updated models on the fly
+# training is still ongoing, we check for updated models on the fly
 # and load them if available.
 
 @app.cls(
@@ -406,7 +414,7 @@ class ModelInference:
 
     @modal.method()
     def generate(self, prompt):
-        self.load_model_impl() # Will load updated model if aviailable, o/w no op.
+        self.load_model_impl() # Load updated model if aviailable, o/w no op.
 
         # Generate 1000 new characters from input prompt
         n_new_tokens = 1000
@@ -424,19 +432,23 @@ class ModelInference:
         str_out = "".join(chars_out)
         return str_out
 
-# First, we will create a simple POST web endpoint for generating text.
+# First, we create a simple POST web endpoint for generating text.
 # e.g.
 # curl -X POST -H 'Content-Type: application/json' --data-binary '{"prompt":
 # "\n"}' https://shariqm--modal-nano-gpt-web-generate-dev.modal.run
 # Similar to [this example](https://modal.com/docs/examples/basic_web).
+
 @app.function(image=torch_image)
 @modal.web_endpoint(method="POST")
 def web_generate(item: dict):
     output = ModelInference().generate.remote(item['prompt'])
     return {'web_generate': output}
 
-# Second, we will create a Gradio web app for generating text. Similar to how
+# Second, we create a Gradio web app for generating text. Similar to how
 # it was done in the [Dreambooth example](https://modal.com/docs/examples/dreambooth_app#:~:text=Copy-,Wrap,-the%20trained%20model).
+# Notice that we don't include a gpu in the app.function parameters since it's
+# not needed, saving us GPU costs for this container.
+
 @app.function(
     image=torch_image,
     concurrency_limit=3,

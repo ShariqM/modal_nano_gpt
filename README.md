@@ -26,3 +26,4 @@ Visit https://shariqm--modal-nano-gpt-fastapi-app-dev.modal.run
 - incorporate multiple GPUs
 - Support loading OpenAI's GPT-2 model
 - Incorporate better generation techniques e.g. nucleus sampling
+- Should we be using modal.NetworkFileSystem instead of volume?
